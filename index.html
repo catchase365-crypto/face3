@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智能人脸 XR 扫描仪 (头部模型终极版)</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils"></script>
+    <style>
+        body { font-family: -apple-system, sans-serif; margin: 0; background: #ffffff; color: #000; display: flex; flex-direction: column; align-items: center; min-height: 100vh; }
+        #container { position: relative; width: 100vw; height: 55vh; background: #ffffff; overflow: hidden; margin-bottom: 15px;}
+        video { display: none; }
+        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; }
+        
+        .dashboard { width: 90%; max-width: 400px; background: #ffffff; border-radius: 20px; padding: 20px; box-sizing: border-box; text-align: center; box-shadow: none; }
+        h2 { margin: 0 0 15px 0; font-size: 20px; color: #000; }
+        #instruction { font-size: 22px; font-weight: bold; color: #007bff; margin-bottom: 20px; height: 30px; }
+        
+        .task-list { display: flex; justify-content: space-between; margin-bottom: 25px; }
+        .task { display: flex; flex-direction: column; align-items: center; opacity: 0.3; transition: 0.3s; color: #333; }
+        .task.active { opacity: 1; transform: scale(1.1); }
+        .task.done { opacity: 1; color: #00ff00; }
+        .icon { font-size: 30px; margin-bottom: 5px; }
+        
+        button { width: 100%; padding: 15px; font-size: 18px; border-radius: 12px; border: 2px solid #000; font-weight: bold; cursor: pointer; transition: 0.3s; }
+        #start_btn { background: #007bff; color: white; }
+        #start_btn:disabled { background: #444; color: #888; cursor: not-allowed; }
+        #view_btn { background: #00ff00; color: #000; display: none; }
+    </style>
+</head>
+<body>
+
+    <div id="container">
+        <video id="input_video" playsinline></video>
+        <canvas id="output_canvas"></canvas>
+    </div>
+
+    <div class="dashboard">
+        <h2 id="status">正在初始化神经网络...</h2>
+        
+        <div id="scan_ui" style="display: none;">
+            <div id="instruction">请将正脸对准屏幕</div>
+            <div class="task-list">
+                <div class="task" id="task_front"><div class="icon">👤</div><span>正脸</span></div>
+                <div class="task" id="task_left"><div class="icon">👈</div><span>左转</span></div>
+                <div class="task" id="task_right"><div class="icon">👉</div><span>右转</span></div>
+                <div class="task" id="task_up"><div class="icon">👆</div><span>仰头</span></div>
+                <div class="task" id="task_down"><div class="icon">👇</div><span>低头</span></div>
+                <div class="task" id="task_blink"><div class="icon">👁️</div><span>眨眼</span></div>
+                <div class="task" id="task_mouth"><div class="icon">😮</div><span>张嘴</span></div>
+                <div class="task" id="task_eyebrow"><div class="icon">🤨</div><span>挑眉</span></div>
+                <div class="task" id="task_smile"><div class="icon">😊</div><span>微笑</span></div>
+            </div>
+        </div>
+
+        <button id="start_btn" disabled>等待摄像头...</button>
+        <button id="view_btn">✅ 建模完成，查看实体模型</button>
+    </div>
+
+    <script type="module">
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        
+        const statusText = document.getElementById('status');
+        const startBtn = document.getElementById('start_btn');
+        const viewBtn = document.getElementById('view_btn');
+        const scanUi = document.getElementById('scan_ui');
+        const instruction = document.getElementById('instruction');
+
+        let isReady = false;
+        let scanPhase = 'idle'; 
+        let poseStartTime = 0;
+
+        function speak(text) {
+            const msg = new SpeechSynthesisUtterance(text);
+            msg.lang = 'zh-CN';
+            window.speechSynthesis.cancel();
+            window.speechSynthesis.speak(msg);
+        }
+        
+        let bestFaceData = null;
+        let bestFaceTexture = null;
+        let sideTextures = { left: null, right: null, up: null, down: null };
+        let cameraAspect = 1.0; 
+
+        const faceMesh = new FaceMesh({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`;
+        }});
+
+        faceMesh.setOptions({
+            maxNumFaces: 1,
+            refineLandmarks: true,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        function detectHeadPose(landmarks) {
+            const nose = landmarks[1];
+            const leftCheek = landmarks[234]; 
+            const rightCheek = landmarks[454]; 
+            const top = landmarks[10];
+            const bottom = landmarks[152];
+
+            const distLeft = Math.abs(nose.x - leftCheek.x);
+            const distRight = Math.abs(nose.x - rightCheek.x);
+            const hRatio = distLeft / (distRight + 0.00001);
+            
+            const vTotal = Math.abs(bottom.y - top.y);
+            const vNose = Math.abs(nose.y - top.y);
+            const vRatio = vNose / vTotal;
+
+            if (vRatio < 0.35) return 'up';
+            if (vRatio > 0.65) return 'down';
+            if (hRatio < 0.4) return 'right'; 
+            if (hRatio > 2.5) return 'left';  
+            if (hRatio > 0.8 && hRatio < 1.2) return 'front';
+            return 'unknown';
+        }
+
+        function detectLiveness(landmarks) {
+            const eyeTop = landmarks[159].y, eyeBot = landmarks[145].y;
+            const mouthTop = landmarks[13].y, mouthBot = landmarks[14].y;
+            const eyebrow = landmarks[52].y, eyeCenter = landmarks[159].y;
+            const mouthL = landmarks[61].x, mouthR = landmarks[291].x;
+            const mouthTopLip = landmarks[0].y, mouthBotLip = landmarks[17].y;
+            return {
+                isBlinking: Math.abs(eyeTop - eyeBot) < 0.012,
+                isMouthOpen: Math.abs(mouthTop - mouthBot) > 0.04,
+                isEyebrowRaised: Math.abs(eyebrow - eyeCenter) > 0.04,
+                isSmiling: (Math.abs(mouthL - mouthR) > 0.16) && (Math.abs(mouthTopLip - mouthBotLip) < 0.035)
+            };
+        }
+
+        function setTaskStatus(taskId, status) {
+            const el = document.getElementById(taskId);
+            if(!el) return;
+            if(status === 'active') { el.className = 'task active'; }
+            if(status === 'done') { 
+                el.className = 'task done'; 
+                const icon = el.querySelector('.icon');
+                if (taskId === 'task_blink') icon.innerText = '😉';
+                else if (taskId === 'task_mouth') icon.innerText = '😲';
+                else if (taskId === 'task_eyebrow') icon.innerText = '🤨';
+                else if (taskId === 'task_smile') icon.innerText = '😁';
+                else icon.innerText = '✅';
+            }
+        }
+
+        function captureFrame(results, w, h) {
+            const offCanvas = document.createElement('canvas');
+            offCanvas.width = w; offCanvas.height = h;
+            const offCtx = offCanvas.getContext('2d');
+            offCtx.translate(w, 0); offCtx.scale(-1, 1);
+            offCtx.drawImage(results.image, 0, 0, w, h);
+            return offCanvas.toDataURL('image/jpeg', 1.0);
+        }
+
+        faceMesh.onResults((results) => {
+            const videoW = videoElement.videoWidth;
+            const videoH = videoElement.videoHeight;
+            if (!videoW || !videoH) return; 
+
+            cameraAspect = videoH / videoW;
+            canvasElement.width = videoW;
+            canvasElement.height = videoH;
+            
+            canvasCtx.save();
+            canvasCtx.fillStyle = "#ffffff";
+            canvasCtx.fillRect(0, 0, videoW, videoH);
+
+            if (scanPhase !== 'done') {
+                canvasCtx.save();
+                canvasCtx.beginPath();
+                canvasCtx.arc(videoW / 2, videoH / 2, Math.min(videoW, videoH) * 0.42, 0, Math.PI * 2); 
+                canvasCtx.clip();
+                canvasCtx.translate(videoW, 0); 
+                canvasCtx.scale(-1, 1);
+                canvasCtx.drawImage(results.image, 0, 0, videoW, videoH);
+                canvasCtx.restore();
+            }
+            
+            if (results.multiFaceLandmarks && results.multiFaceLandmarks[0]) {
+                if (!isReady) {
+                    isReady = true;
+                    statusText.innerText = "面部锁定成功";
+                    startBtn.innerText = "开始 3D 面容识别";
+                    startBtn.disabled = false;
+                }
+
+                const face = results.multiFaceLandmarks[0];
+                const pose = detectHeadPose(face);
+
+                for (const landmark of face) {
+                    const x = (1 - landmark.x) * videoW;
+                    const y = landmark.y * videoH;
+                    canvasCtx.fillStyle = scanPhase !== 'idle' && scanPhase !== 'done' ? "#00ff00" : "#777";
+                    canvasCtx.fillRect(x, y, 2, 2);
+                }
+
+                const liveness = detectLiveness(face);
+
+                if (['front', 'left', 'right', 'up', 'down'].includes(scanPhase)) {
+                    if (pose === scanPhase) {
+                        if (!poseStartTime) poseStartTime = Date.now();
+                        if (Date.now() - poseStartTime < 1000) {
+                            instruction.innerText = "请固定 1 秒...";
+                            return;
+                        }
+                    } else {
+                        poseStartTime = 0;
+                        return;
+                    }
+                }
+
+                if (scanPhase === 'front' && pose === 'front') {
+                    bestFaceData = face.map(pt => ({ x: pt.x, y: pt.y, z: pt.z }));
+                    bestFaceTexture = captureFrame(results, videoW, videoH);
+                    setTaskStatus('task_front', 'done');
+                    instruction.innerText = "请向左缓慢转头";
+                    speak("很好，请向左转，固定一秒");
+                    scanPhase = 'left';
+                    poseStartTime = 0;
+                    setTaskStatus('task_left', 'active');
+                } else if (scanPhase === 'left' && pose === 'left') {
+                    sideTextures.left = captureFrame(results, videoW, videoH);
+                    setTaskStatus('task_left', 'done');
+                    instruction.innerText = "请向右缓慢转头";
+                    speak("请向右转，固定一秒");
+                    scanPhase = 'right';
+                    poseStartTime = 0;
+                    setTaskStatus('task_right', 'active');
+                } else if (scanPhase === 'right' && pose === 'right') {
+                    sideTextures.right = captureFrame(results, videoW, videoH);
+                    setTaskStatus('task_right', 'done');
+                    instruction.innerText = "请向上抬头";
+                    speak("请向上抬头，拍摄鼻孔细节，固定一秒");
+                    scanPhase = 'up';
+                    poseStartTime = 0;
+                    setTaskStatus('task_up', 'active');
+                } else if (scanPhase === 'up' && pose === 'up') {
+                    sideTextures.up = captureFrame(results, videoW, videoH);
+                    setTaskStatus('task_up', 'done');
+                    instruction.innerText = "请向下低头";
+                    speak("请向下低头，固定一秒");
+                    scanPhase = 'down';
+                    poseStartTime = 0;
+                    setTaskStatus('task_down', 'active');
+                } else if (scanPhase === 'down' && pose === 'down') {
+                    sideTextures.down = captureFrame(results, videoW, videoH);
+                    setTaskStatus('task_down', 'done');
+                    instruction.innerText = "请快速眨眼";
+                    speak("请眨眼");
+                    scanPhase = 'blink';
+                    setTaskStatus('task_blink', 'active');
+                } else if (scanPhase === 'blink' && liveness.isBlinking) {
+                    setTaskStatus('task_blink', 'done');
+                    instruction.innerText = "请张开嘴巴";
+                    speak("请张大嘴巴");
+                    scanPhase = 'mouth';
+                    setTaskStatus('task_mouth', 'active');
+                } else if (scanPhase === 'mouth' && liveness.isMouthOpen) {
+                    setTaskStatus('task_mouth', 'done');
+                    instruction.innerText = "请用力挑眉";
+                    speak("很好，请用力挑眉");
+                    scanPhase = 'eyebrow';
+                    setTaskStatus('task_eyebrow', 'active');
+                } else if (scanPhase === 'eyebrow' && liveness.isEyebrowRaised) {
+                    setTaskStatus('task_eyebrow', 'done');
+                    instruction.innerText = "请露出微笑";
+                    speak("请保持微笑，捕捉表情细节");
+                    scanPhase = 'smile';
+                    setTaskStatus('task_smile', 'active');
+                } else if (scanPhase === 'smile' && liveness.isSmiling) {
+                    setTaskStatus('task_smile', 'done');
+                    instruction.innerText = "真身校验成功！";
+                    speak("所有动作已完成，模型正在生成");
+                    instruction.style.color = "#00ff00";
+                    scanPhase = 'done';
+                    setTimeout(() => {
+                        startBtn.style.display = 'none';
+                        viewBtn.style.display = 'block';
+                    }, 500);
+                }
+            } else {
+                if (scanPhase !== 'idle' && scanPhase !== 'done') {
+                    instruction.innerText = "⚠️ 丢失人脸，请回到画面中";
+                    instruction.style.color = "#ff4444";
+                }
+            }
+            canvasCtx.restore();
+        });
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => { await faceMesh.send({image: videoElement}); },
+            width: 1280, height: 720
+        });
+        camera.start();
+
+        startBtn.onclick = () => {
+            startBtn.style.display = 'none';
+            statusText.style.display = 'none';
+            scanUi.style.display = 'block';
+            scanPhase = 'front';
+            speak("请正对屏幕，固定一秒");
+            instruction.innerText = "请注视屏幕正中央";
+            instruction.style.color = "#ffeb3b";
+            setTaskStatus('task_front', 'active');
+        };
+
+        // --- 核心修改部分：对接形态键模型 ---
+        viewBtn.onclick = () => {
+            if (!bestFaceData || !bestFaceTexture) return alert("数据生成失败");
+            
+            sessionStorage.setItem('faceTexture', bestFaceTexture);
+            
+            const newWindow = window.open('', '_blank');
+            newWindow.document.write(`
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>3D 实体人脸展示 - 头部补充版</title>
+                    <style>
+                        body { margin: 0; background: #000; overflow: hidden; color: #fff; font-family: sans-serif; }
+                        #loading { position: absolute; width: 100%; text-align: center; top: 45%; font-size: 18px; }
+                        .ui-hint { position: absolute; bottom: 20px; width: 100%; text-align: center; color: #888; pointer-events: none; }
+                    </style>
+                    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"><\/script>
+                </head>
+                <body>
+                    <div id="loading">正在加载高精度 3D 头部模型...</div>
+                    <div class="ui-hint">拖动鼠标旋转查看</div>
+                    
+                    <script type="module">
+                        import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.128.0/examples/jsm/controls/OrbitControls.js';
+                        import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.128.0/examples/jsm/loaders/GLTFLoader.js';
+
+                        const textureBase64 = sessionStorage.getItem('faceTexture');
+                        
+                        const scene = new THREE.Scene();
+                        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+                        camera.position.set(0, 0, 0.7);
+
+                        const renderer = new THREE.WebGLRenderer({ antialias: true });
+                        renderer.setSize(window.innerWidth, window.innerHeight);
+                        renderer.setPixelRatio(window.devicePixelRatio);
+                        renderer.outputEncoding = THREE.sRGBEncoding;
+                        document.body.appendChild(renderer.domElement);
+
+                        const controls = new OrbitControls(camera, renderer.domElement);
+                        controls.enableDamping = true;
+
+                        // 环境灯光
+                        scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+                        const light = new THREE.DirectionalLight(0xffffff, 0.8);
+                        light.position.set(2, 2, 5);
+                        scene.add(light);
+
+                        // 加载刚刚捕捉到的“脸皮”贴图
+                        const textureLoader = new THREE.TextureLoader();
+                        const myTexture = textureLoader.load(textureBase64);
+                        myTexture.flipY = false; // 重要：修正 GLTF 贴图坐标
+
+                        // 加载完美的 3D 头部底胚
+                        const loader = new GLTFLoader();
+                        loader.load('https://threejs.org/examples/models/gltf/facecap.glb', (gltf) => {
+                            document.getElementById('loading').style.display = 'none';
+                            
+                            const head = gltf.scene.children[0];
+                            
+                            // 将你的脸部贴图应用到这个完美的头部模型上
+                            head.material = new THREE.MeshStandardMaterial({
+                                map: myTexture,
+                                roughness: 0.4,
+                                metalness: 0.1
+                            });
+
+                            scene.add(gltf.scene);
+                        });
+
+                        function animate() {
+                            requestAnimationFrame(animate);
+                            controls.update();
+                            renderer.render(scene, camera);
+                        }
+                        animate();
+
+                        window.onresize = () => {
+                            camera.aspect = window.innerWidth / window.innerHeight;
+                            camera.updateProjectionMatrix();
+                            renderer.setSize(window.innerWidth, window.innerHeight);
+                        };
+                    <\/script>
+                </body>
+                </html>
+            `);
+            newWindow.document.close();
+        };
+    </script>
+</body>
+</html>
